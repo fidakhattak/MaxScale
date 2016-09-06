@@ -61,10 +61,10 @@ MODULE_INFO info =
     "A simple query logging filter"
 };
 
+
 static char *version_str = "V1.1.1";
 static char *WRITE = "w";
 static char *APPEND = "a";
-static char *keyword = "USE";
 static pthread_mutex_t filemutex;
 
 /** Formatting buffer size */
@@ -78,10 +78,9 @@ static void *newSession(FILTER *instance, SESSION *session);
 static void closeSession(FILTER *instance, void *session);
 static void freeSession(FILTER *instance, void *session);
 static void setDownstream(FILTER *instance, void *fsession, DOWNSTREAM *downstream);
-static bool openLog(char *filename, FILE **fp, char *fp_parameter);
-static int routeQuery(FILTER *instance, void *fsession, GWBUF *queue);
+static FILE *openLog(char *filename,  char *fp_parameter);
+static int  routeQuery(FILTER *instance, void *fsession, GWBUF *queue);
 static void diagnostic(FILTER *instance, void *fsession, DCB *dcb);
-static char *getDbName(char * sql_statement);
 
 static FILTER_OBJECT MyObject =
 {
@@ -141,7 +140,7 @@ typedef struct
     char *dbname;
     char *user;
     char *remote;
-    int session_number;
+    int session_id;
     bool select_flag;
 } QLA_SESSION;
 
@@ -342,30 +341,30 @@ createInstance(char **options, FILTER_PARAMETER **params)
             
 
 /**
- * @brief 
+ * @brief This function returns a new filepointer when supplied with filename and
+ * parameters
  * @param filename The filename for which a filepointer should be initialized
  * @param fp  The filepointer to be initialized 
  * @return True if successful, false otherwise 
  */
 
 
-static bool
-openLog(char *filename, FILE ** fp, char *fp_parameters)
+static FILE *
+openLog(char *filename, char *fp_parameters)
 {
+    FILE *fp = NULL;
+    
     if (filename == NULL)
     {   
         MXS_INFO("filename is null");
-        return false;
+        return fp;
     }
     
-    if ((*fp = calloc(1, sizeof(FILE *))) != NULL)
-    {   
-        if((*fp = fopen(filename, fp_parameters)) != NULL) 
-         {
-            MXS_INFO("file %s opened successfully", filename);
-            return true;           
-         } 
-     }
+    if((fp = fopen(filename, fp_parameters)) != NULL) 
+    {
+        MXS_INFO("file %s opened successfully", filename);
+        return fp;           
+    } 
     else
     {    
         char errbuf[STRERROR_BUFLEN];
@@ -375,20 +374,28 @@ openLog(char *filename, FILE ** fp, char *fp_parameters)
              errno,
              strerror_r(errno, errbuf, sizeof(errbuf)));
     }
-    return false;
+    return fp;
 }
 
 
 
-/* Thread safe function for writing to files*/
+
+/**
+ * @brief Thread safe function for writing to files
+ * @param fp filepointer to which contents should be written
+ * @param buffer contains contents to be written
+ */
 
 static void
 writeLog(FILE *fp, char *buffer)
 {
-    pthread_mutex_lock(&filemutex);
-    fprintf(fp, "%s",buffer);
-    fflush(fp);
-    pthread_mutex_unlock(&filemutex);
+    if ((fp != NULL) && (buffer != NULL)) 
+    {    
+        pthread_mutex_lock(&filemutex);
+        fprintf(fp, "%s",buffer);
+        fflush(fp);
+        pthread_mutex_unlock(&filemutex);
+    }
 }
 
 
@@ -423,10 +430,10 @@ newSession(FILTER *instance, SESSION *session)
       
         my_session->active = 1;
         my_session->select_flag = false;
-        /* set the session_number for this session equal to the 
+        /* set the session_id for this session equal to the 
          * total count of sessons for this instance */
 
-        my_session->session_number = my_instance->sessions;
+        my_session->session_id = my_instance->sessions;
         remote = session_get_remote(session);
         userName = session_getUser(session);
         ss_dassert(userName && remote);
@@ -450,30 +457,34 @@ newSession(FILTER *instance, SESSION *session)
         atomic_add(&(my_instance->sessions), 1);
 
         if (my_session->active)
-        {
+        {                         
             // Open session file for write
-            if (!openLog(my_session->filename, &my_session->fp, WRITE))
+                    
+            if((my_session->fp = openLog(my_instance->filebase, WRITE)) == NULL) 
             {
-                free(my_session->filename);
-                free(my_session);
-                my_session = NULL;
-                return my_session;
-               
+                    free(my_session->filename);
+                    free(my_session);
+                    my_session = NULL;
+                    return my_session;
             }
+            
             // Open combinedlog for append
             my_instance->combinedlog_active = false;
             if(my_instance->combinedlog_path != NULL) 
             {
-                if(openLog(my_instance->combinedlog_path, &my_session->combinedlog_fp, APPEND)) 
+                if((my_session->combinedlog_fp = openLog(my_instance->combinedlog_path, APPEND)) != NULL) 
                 {
-                    my_instance->combinedlog_active = true;
+                        my_instance->combinedlog_active = true;
                 }                        
+
             }
             //Check if dblog_path is not null and set dblog_active. Files are created later 
             //for each database during routeQuery
             if(my_instance->dblog_path != NULL)
             {
-                my_instance->dblog_active = true;
+                {
+                    my_instance->dblog_active = true;
+                }
             }
         }
     }
@@ -499,6 +510,7 @@ closeSession(FILTER *instance, void *session)
         fclose(my_session->fp);
     }
 }
+
 
 /**
  * Free the memory associated with the session
@@ -549,19 +561,14 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
     QLA_INSTANCE *my_instance = (QLA_INSTANCE *) instance;
     QLA_SESSION *my_session = (QLA_SESSION *) session;
     char *ptr;
-    char *statement_ptr;
     int length = 0;
     struct tm t;
     struct timeval tv;
     char buffer[QLA_STRING_BUFFER_LARGE];
     char time_buffer[QLA_STRING_BUFFER_SMALL];            
-    char *complete_file_path = NULL;
-    
-    
-    if (my_session->fp == NULL)
-        MXS_INFO("qlafilter: filepointer is null");
-
-    if (my_session->active)
+    char dbFilename[QLA_STRING_BUFFER_SMALL];
+     
+    if ((my_session->active) && (my_session->fp != NULL))
     {
         if (queue->next != NULL)
         {
@@ -581,22 +588,11 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                         my_session->remote, trim(squeeze_whitespace(ptr)));
                 writeLog(my_session->fp, buffer);
             }
-                /* write the buffer contents to the log file */
-                /*Now check if the combinedlog is active */
-                
-            if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
-            {   
-                char session_string [QLA_STRING_BUFFER_SMALL];
-                sprintf(session_string, "Session Number:%d", my_session->session_number);                   
-                sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
-                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
-                writeLog(my_session->combinedlog_fp, buffer);
-            }                 
+                              
                 
             /* Check if dblog is active (path specified) */  
             if ((my_instance->dblog_active))
             {
-                statement_ptr = modutil_get_SQL(queue);
                
             /* Two queries are routed for a single USE "databaseName" statement
             The first query has SELECT DATABASE() as the statement statement
@@ -605,21 +601,21 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
             If the flag is set, the contents of the (next) statement are copied
                to the dbName* pointer  */
                         
-                
                 if(my_session->select_flag) 
                 {
-                    if(openLog(statement_ptr, &my_session->dblog_fp, APPEND)) 
+                    sprintf(buffer, "%s%s.log",my_instance->dblog_path, ptr);                     
+                    if((my_session->dblog_fp = openLog(buffer, APPEND)) != NULL) 
                     {
-                        MXS_INFO("qlafilter: database changed to => %s", statement_ptr);
+                        MXS_INFO("qlafilter: database changed to => %s for session %d", ptr, my_session->session_id);
                     }
                     my_session->select_flag = false;
                  } 
                     
                 //compare the statement with SELECT DATABASE keywod 
                 else
-                if(!strcmp(statement_ptr, "SELECT DATABASE()"))
+                if(!strcmp(ptr, "SELECT DATABASE()"))
                 { 
-                    MXS_INFO("qlatfilter: new database selected => %s", statement_ptr);  
+                    MXS_INFO("qlatfilter: new database selected => %s for session %d", ptr, my_session->session_id);  
                     my_session->select_flag = true;
                 }
                 /*Keep writing to the already open file .. no database change detected */
@@ -631,6 +627,18 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                     }
                 }
             }
+              
+                /* write the buffer contents to the log file */
+                /*Now check if the combinedlog is active */
+                
+            if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
+            {   
+                char session_string [QLA_STRING_BUFFER_SMALL];
+                sprintf(session_string, "Session Number:%d", my_session->session_id);                   
+                sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
+                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
+                writeLog(my_session->combinedlog_fp, buffer);
+            } 
         }
     }
                  
@@ -639,13 +647,6 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
     /* Pass the query downstream */
     return my_session->down.routeQuery(my_session->down.instance,
                                        my_session->down.session, queue);
-}
-
-
-static 
-char * getDbName(char *statement)
-{
-    return NULL;
 }
 
 /**
@@ -691,4 +692,3 @@ diagnostic(FILTER *instance, void *fsession, DCB *dcb)
                    my_instance->nomatch);
     }
 }
-
