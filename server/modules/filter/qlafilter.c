@@ -47,6 +47,11 @@
 #include <regex.h>
 #include <string.h>
 #include <atomic.h>
+#include <pthread.h>
+#include <query_classifier.h>
+
+#include <sharding_common.h>
+
 
 MODULE_INFO info =
 {
@@ -57,10 +62,14 @@ MODULE_INFO info =
 };
 
 static char *version_str = "V1.1.1";
+static char *new_file = "w";
+static char *append_file = "a";
+static char *keyword = "USE";
+static pthread_mutex_t filemutex;
 
 /** Formatting buffer size */
-#define QLA_STRING_BUFFER_SIZE 1024
-
+#define QLA_STRING_BUFFER_LARGE 1024
+#define QLA_STRING_BUFFER_SMALL 255
 /*
  * The filter entry points
  */
@@ -69,9 +78,11 @@ static void *newSession(FILTER *instance, SESSION *session);
 static void closeSession(FILTER *instance, void *session);
 static void freeSession(FILTER *instance, void *session);
 static void setDownstream(FILTER *instance, void *fsession, DOWNSTREAM *downstream);
+static bool newLogfile(char *filename, FILE **fp, char *fp_parameter);
 static int routeQuery(FILTER *instance, void *fsession, GWBUF *queue);
 static void diagnostic(FILTER *instance, void *fsession, DCB *dcb);
-
+static char *getDbName(char* query);
+static char *getOperation(char * query);
 
 static FILTER_OBJECT MyObject =
 {
@@ -94,10 +105,15 @@ static FILTER_OBJECT MyObject =
  * To this base a session number is attached such that each session will
  * have a unique name.
  */
+ 
 typedef struct
 {
     int sessions; /* The count of sessions */
     char *filebase; /* The filename base */
+    bool combinedlog_active;  /* Flag identifying if the combinedlog is active */
+    char *combinedlog_path; /* The path for the combined log. The file name is always combined.log */
+    bool  dblog_active; /* Flag identifying if the dblog is active */
+    char *dblog_path; /*The path for database log files.*/
     char *source; /* The source of the client connection */
     char *userName; /* The user name to filter on */
     char *match; /* Optional text to match against */
@@ -114,14 +130,19 @@ typedef struct
  *
  * It also holds the file descriptor to which queries are written.
  */
+ 
 typedef struct
 {
     DOWNSTREAM down;
     char *filename;
     FILE *fp;
+    FILE *dblog_fp;
+    FILE *combinedlog_fp;
     int active;
+    char *dbname;
     char *user;
     char *remote;
+    int session_number;
 } QLA_SESSION;
 
 /**
@@ -183,6 +204,8 @@ createInstance(char **options, FILTER_PARAMETER **params)
         my_instance->match = NULL;
         my_instance->nomatch = NULL;
         my_instance->filebase = NULL;
+        my_instance->combinedlog_path = NULL;
+        my_instance->dblog_path = NULL;
         bool error = false;
 
         if (params)
@@ -209,6 +232,16 @@ createInstance(char **options, FILTER_PARAMETER **params)
                 {
                     my_instance->filebase = strdup(params[i]->value);
                 }
+                else if (!strcmp(params[i]->name, "combinedlog"))
+                {
+                    my_instance->combinedlog_path = strdup(params[i]->value);
+                    MXS_INFO("qlafilter: Combined log enabled. Logging to path %s", params[i]->value);
+                }
+                else if (!strcmp(params[i]->name, "dblog"))
+                {
+                    my_instance->dblog_path = strdup(params[i]->value);
+                    MXS_INFO("qlafilter: Database log enabled. Logging to path %s", params[i]->value);
+                }
                 else if (!filter_standard_parameter(params[i]->name))
                 {
                     MXS_ERROR("qlafilter: Unexpected parameter '%s'.",
@@ -227,16 +260,16 @@ createInstance(char **options, FILTER_PARAMETER **params)
                 if (!strcasecmp(options[i], "ignorecase"))
                 {
                     cflags |= REG_ICASE;
-                }
+                 }
                 else if (!strcasecmp(options[i], "case"))
                 {
                     cflags &= ~REG_ICASE;
-                }
+                 }
                 else if (!strcasecmp(options[i], "extended"))
                 {
                     cflags |= REG_EXTENDED;
-                }
-                else
+                 }
+                 else
                 {
                     MXS_ERROR("qlafilter: Unsupported option '%s'.",
                               options[i]);
@@ -250,7 +283,17 @@ createInstance(char **options, FILTER_PARAMETER **params)
             MXS_ERROR("qlafilter: No 'filebase' parameter defined.");
             error = true;
         }
-
+        if(my_instance->combinedlog_path != NULL) 
+        {
+            MXS_INFO("qlafilter: 'combinedlog' parameter defined");
+            my_instance->combinedlog_active = true;
+        }
+        if(my_instance->dblog_path != NULL) 
+        {
+            MXS_INFO("qlafilter: 'dblog' parameter defined");
+             my_instance->dblog_active = true;
+        }
+        
         my_instance->sessions = 0;
         if (my_instance->match &&
             regcomp(&my_instance->re, my_instance->match, cflags))
@@ -280,13 +323,14 @@ createInstance(char **options, FILTER_PARAMETER **params)
                 free(my_instance->match);
                 regfree(&my_instance->re);
             }
-
             if (my_instance->nomatch)
             {
                 free(my_instance->nomatch);
                 regfree(&my_instance->nore);
             }
             free(my_instance->filebase);
+            free(my_instance->combinedlog_path);
+            free(my_instance->dblog_path);
             free(my_instance->source);
             free(my_instance->userName);
             free(my_instance);
@@ -295,6 +339,57 @@ createInstance(char **options, FILTER_PARAMETER **params)
     }
     return (FILTER *) my_instance;
 }
+            
+
+/**
+ * @brief 
+ * @param filename
+ * @param fp
+ * @return 
+ */
+
+
+static bool
+newLogfile(char *filename, FILE ** fp, char *fp_parameters)
+{
+    if (filename == NULL)
+    {   
+        MXS_INFO("filename is null");
+        return false;
+    }
+    
+    if ((*fp = calloc(1, sizeof(FILE *))) != NULL)
+    {   
+        if((*fp = fopen(filename, fp_parameters)) != NULL) 
+         {
+            MXS_INFO("file %s opened successfully", filename);
+            return true;           
+         } 
+     }
+    else
+    {    
+        char errbuf[STRERROR_BUFLEN];
+        MXS_ERROR("Opening combinedlog output file %s for qla "
+            "fileter failed due to %d, %s",
+             filename,
+             errno,
+             strerror_r(errno, errbuf, sizeof(errbuf)));
+    }
+    return false;
+}
+
+
+
+/* Thread safe function for writing to files*/
+static void
+writeLog(FILE *fp, char *buffer)
+{
+    pthread_mutex_lock(&filemutex);
+    fprintf(fp, "%s",buffer);
+    fflush(fp);
+    pthread_mutex_unlock(&filemutex);
+}
+
 
 /**
  * Associate a new session with this instance of the filter.
@@ -324,8 +419,12 @@ newSession(FILTER *instance, SESSION *session)
             free(my_session);
             return NULL;
         }
+      
         my_session->active = 1;
+        /* set the session_number for this session equal to the 
+         * total count of sessons for this instance */
 
+        my_session->session_number = my_instance->sessions;
         remote = session_get_remote(session);
         userName = session_getUser(session);
         ss_dassert(userName && remote);
@@ -350,28 +449,31 @@ newSession(FILTER *instance, SESSION *session)
 
         if (my_session->active)
         {
-            my_session->fp = fopen(my_session->filename, "w");
-
-            if (my_session->fp == NULL)
+            // Open session file for write
+            if (!newLogfile(my_session->filename, &my_session->fp, new_file))
             {
-                char errbuf[STRERROR_BUFLEN];
-                MXS_ERROR("Opening output file for qla "
-                          "fileter failed due to %d, %s",
-                          errno,
-                          strerror_r(errno, errbuf, sizeof(errbuf)));
                 free(my_session->filename);
                 free(my_session);
                 my_session = NULL;
+                return my_session;
+               
+            }
+            // Open combinedlog for append
+            my_instance->combinedlog_active = false;
+            if(my_instance->combinedlog_path != NULL) 
+            {
+                if(newLogfile(my_instance->combinedlog_path, &my_session->combinedlog_fp, append_file)) 
+                {
+                    my_instance->combinedlog_active = true;
+                }                        
+            }
+            //Check if dblog_path is not null and set dblog_active. Files are created later 
+            //for each database during routeQuery
+            if(my_instance->dblog_path != NULL)
+            {
+                my_instance->dblog_active = true;
             }
         }
-    }
-    else
-    {
-        char errbuf[STRERROR_BUFLEN];
-        MXS_ERROR("Memory allocation for qla filter failed due to "
-                  "%d, %s.",
-                  errno,
-                  strerror_r(errno, errbuf, sizeof(errbuf)));
     }
     return my_session;
 }
@@ -384,6 +486,7 @@ newSession(FILTER *instance, SESSION *session)
  * @param instance  The filter instance data
  * @param session   The session being closed
  */
+ 
 static void
 closeSession(FILTER *instance, void *session)
 {
@@ -405,7 +508,8 @@ static void
 freeSession(FILTER *instance, void *session)
 {
     QLA_SESSION *my_session = (QLA_SESSION *) session;
-
+//    free(my_session->fp);
+//    free(my_session->combinedlog_fp);
     free(my_session->filename);
     free(session);
     return;
@@ -446,6 +550,12 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
     int length = 0;
     struct tm t;
     struct timeval tv;
+    char buffer[QLA_STRING_BUFFER_LARGE];
+    char time_buffer[QLA_STRING_BUFFER_SMALL];            
+    char *complete_file_path = NULL;
+    
+    if (my_session->fp == NULL)
+        MXS_INFO("qlafilter: filepointer is null");
 
     if (my_session->active)
     {
@@ -460,19 +570,68 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 (my_instance->nomatch == NULL ||
                  regexec(&my_instance->nore, ptr, 0, NULL, 0) != 0))
             {
-                char buffer[QLA_STRING_BUFFER_SIZE];
-                gettimeofday(&tv, NULL);
-                localtime_r(&tv.tv_sec, &t);
-                strftime(buffer, sizeof(buffer), "%F %T", &t);
-                fprintf(my_session->fp, "%s,%s@%s,%s\n", buffer, my_session->user,
+                
+                /*Log to file if session is active */
+                if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))                
+                {
+                    
+                    gettimeofday(&tv, NULL);
+                    localtime_r(&tv.tv_sec, &t);
+                    strftime(time_buffer, sizeof(time_buffer), "%F %T", &t);
+                    sprintf(buffer, "%s,%s@%s,%s\n", time_buffer, my_session->user,
                         my_session->remote, trim(squeeze_whitespace(ptr)));
+                    writeLog(my_session->fp, buffer);
+                }
+                /* write the buffer contents to the log file */
+               
+                /*Now check if the combinedlog is active */
+                if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
+                {   
+                    char session_string [QLA_STRING_BUFFER_SMALL];
+                    sprintf(session_string, "Session Number:%d", my_session->session_number);                   
+                    sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
+                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
+                    writeLog(my_session->combinedlog_fp, buffer);
+                 }                 
+                
+                 /* Check if dblog is active (path specified) */  
+                 if ((my_instance->dblog_active))
+                 {                                      /*
+                    The databaseName detection goes here
+                   */
+                   char *operation;
+                    if ((operation = getOperation(ptr)) != NULL) 
+                    {
+                        if (strncmp(keyword, operation, strlen(operation)) == 0) 
+                        {                    
+                            char* name = getDbName(ptr);
+                        }
+                        MXS_INFO("qlatfilter: Database changed");
+                    }
+                }
             }
-            free(ptr);
         }
     }
+                 
+            free(ptr);
+    
     /* Pass the query downstream */
     return my_session->down.routeQuery(my_session->down.instance,
                                        my_session->down.session, queue);
+}
+
+
+static
+char * getDbName(char* query) 
+{
+    return NULL;
+}
+
+
+static 
+char * getOperation(char * query)
+{
+    return NULL;
 }
 
 /**
@@ -518,3 +677,4 @@ diagnostic(FILTER *instance, void *fsession, DCB *dcb)
                    my_instance->nomatch);
     }
 }
+
