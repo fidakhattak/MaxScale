@@ -62,8 +62,8 @@ MODULE_INFO info =
 };
 
 static char *version_str = "V1.1.1";
-static char *new_file = "w";
-static char *append_file = "a";
+static char *WRITE = "w";
+static char *APPEND = "a";
 static char *keyword = "USE";
 static pthread_mutex_t filemutex;
 
@@ -78,11 +78,10 @@ static void *newSession(FILTER *instance, SESSION *session);
 static void closeSession(FILTER *instance, void *session);
 static void freeSession(FILTER *instance, void *session);
 static void setDownstream(FILTER *instance, void *fsession, DOWNSTREAM *downstream);
-static bool newLogfile(char *filename, FILE **fp, char *fp_parameter);
+static bool openLog(char *filename, FILE **fp, char *fp_parameter);
 static int routeQuery(FILTER *instance, void *fsession, GWBUF *queue);
 static void diagnostic(FILTER *instance, void *fsession, DCB *dcb);
-static char *getDbName(char* query);
-static char *getOperation(char * query);
+static char *getDbName(char * sql_statement);
 
 static FILTER_OBJECT MyObject =
 {
@@ -143,6 +142,7 @@ typedef struct
     char *user;
     char *remote;
     int session_number;
+    bool select_flag;
 } QLA_SESSION;
 
 /**
@@ -343,14 +343,14 @@ createInstance(char **options, FILTER_PARAMETER **params)
 
 /**
  * @brief 
- * @param filename
- * @param fp
- * @return 
+ * @param filename The filename for which a filepointer should be initialized
+ * @param fp  The filepointer to be initialized 
+ * @return True if successful, false otherwise 
  */
 
 
 static bool
-newLogfile(char *filename, FILE ** fp, char *fp_parameters)
+openLog(char *filename, FILE ** fp, char *fp_parameters)
 {
     if (filename == NULL)
     {   
@@ -381,6 +381,7 @@ newLogfile(char *filename, FILE ** fp, char *fp_parameters)
 
 
 /* Thread safe function for writing to files*/
+
 static void
 writeLog(FILE *fp, char *buffer)
 {
@@ -421,6 +422,7 @@ newSession(FILTER *instance, SESSION *session)
         }
       
         my_session->active = 1;
+        my_session->select_flag = false;
         /* set the session_number for this session equal to the 
          * total count of sessons for this instance */
 
@@ -450,7 +452,7 @@ newSession(FILTER *instance, SESSION *session)
         if (my_session->active)
         {
             // Open session file for write
-            if (!newLogfile(my_session->filename, &my_session->fp, new_file))
+            if (!openLog(my_session->filename, &my_session->fp, WRITE))
             {
                 free(my_session->filename);
                 free(my_session);
@@ -462,7 +464,7 @@ newSession(FILTER *instance, SESSION *session)
             my_instance->combinedlog_active = false;
             if(my_instance->combinedlog_path != NULL) 
             {
-                if(newLogfile(my_instance->combinedlog_path, &my_session->combinedlog_fp, append_file)) 
+                if(openLog(my_instance->combinedlog_path, &my_session->combinedlog_fp, APPEND)) 
                 {
                     my_instance->combinedlog_active = true;
                 }                        
@@ -547,12 +549,14 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
     QLA_INSTANCE *my_instance = (QLA_INSTANCE *) instance;
     QLA_SESSION *my_session = (QLA_SESSION *) session;
     char *ptr;
+    char *statement_ptr;
     int length = 0;
     struct tm t;
     struct timeval tv;
     char buffer[QLA_STRING_BUFFER_LARGE];
     char time_buffer[QLA_STRING_BUFFER_SMALL];            
     char *complete_file_path = NULL;
+    
     
     if (my_session->fp == NULL)
         MXS_INFO("qlafilter: filepointer is null");
@@ -570,43 +574,60 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 (my_instance->nomatch == NULL ||
                  regexec(&my_instance->nore, ptr, 0, NULL, 0) != 0))
             {
-                
-                /*Log to file if session is active */
-                if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))                
-                {
-                    
-                    gettimeofday(&tv, NULL);
-                    localtime_r(&tv.tv_sec, &t);
-                    strftime(time_buffer, sizeof(time_buffer), "%F %T", &t);
-                    sprintf(buffer, "%s,%s@%s,%s\n", time_buffer, my_session->user,
+                gettimeofday(&tv, NULL);
+                localtime_r(&tv.tv_sec, &t);
+                strftime(time_buffer, sizeof(time_buffer), "%F %T", &t);
+                sprintf(buffer, "%s,%s@%s,%s\n", time_buffer, my_session->user,
                         my_session->remote, trim(squeeze_whitespace(ptr)));
-                    writeLog(my_session->fp, buffer);
-                }
+                writeLog(my_session->fp, buffer);
+            }
                 /* write the buffer contents to the log file */
-               
                 /*Now check if the combinedlog is active */
-                if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
-                {   
-                    char session_string [QLA_STRING_BUFFER_SMALL];
-                    sprintf(session_string, "Session Number:%d", my_session->session_number);                   
-                    sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
-                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
-                    writeLog(my_session->combinedlog_fp, buffer);
-                 }                 
                 
-                 /* Check if dblog is active (path specified) */  
-                 if ((my_instance->dblog_active))
-                 {                                      /*
-                    The databaseName detection goes here
-                   */
-                   char *operation;
-                    if ((operation = getOperation(ptr)) != NULL) 
+            if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
+            {   
+                char session_string [QLA_STRING_BUFFER_SMALL];
+                sprintf(session_string, "Session Number:%d", my_session->session_number);                   
+                sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
+                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
+                writeLog(my_session->combinedlog_fp, buffer);
+            }                 
+                
+            /* Check if dblog is active (path specified) */  
+            if ((my_instance->dblog_active))
+            {
+                statement_ptr = modutil_get_SQL(queue);
+               
+            /* Two queries are routed for a single USE "databaseName" statement
+            The first query has SELECT DATABASE() as the statement statement
+            The second query has the name of the databsae used with the USE keyword
+            First we look for the SELECT DATABASE statement and if found, set the flag
+            If the flag is set, the contents of the (next) statement are copied
+               to the dbName* pointer  */
+                        
+                
+                if(my_session->select_flag) 
+                {
+                    if(openLog(statement_ptr, &my_session->dblog_fp, APPEND)) 
                     {
-                        if (strncmp(keyword, operation, strlen(operation)) == 0) 
-                        {                    
-                            char* name = getDbName(ptr);
-                        }
-                        MXS_INFO("qlatfilter: Database changed");
+                        MXS_INFO("qlafilter: database changed to => %s", statement_ptr);
+                    }
+                    my_session->select_flag = false;
+                 } 
+                    
+                //compare the statement with SELECT DATABASE keywod 
+                else
+                if(!strcmp(statement_ptr, "SELECT DATABASE()"))
+                { 
+                    MXS_INFO("qlatfilter: new database selected => %s", statement_ptr);  
+                    my_session->select_flag = true;
+                }
+                /*Keep writing to the already open file .. no database change detected */
+                else
+                {
+                    if(my_session->dblog_fp != NULL) 
+                    {
+                        writeLog(my_session->dblog_fp, buffer);
                     }
                 }
             }
@@ -621,15 +642,8 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
 }
 
 
-static
-char * getDbName(char* query) 
-{
-    return NULL;
-}
-
-
 static 
-char * getOperation(char * query)
+char * getDbName(char *statement)
 {
     return NULL;
 }
