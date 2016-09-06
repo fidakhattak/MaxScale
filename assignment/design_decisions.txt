@@ -1,0 +1,44 @@
+
+#Usage:
+
+In your Filter block, put the last two lines as shown
+
+[MyLogFilter]
+type=filter
+module=qlafilter
+filebase=/var/log/qla/qla.log
+combinedlog=/var/log/qla/combined.log
+dblog=/var/log/qla/  
+
+The last two parameters are the file-path and directory-path (respectively) for combined and dblog log files.  
+
+
+#Design Decisions:
+
+Requirement: Two new options for creating logs. A unified single log for all sessions and queries and a database specific log which uses different files for logging based on database name.
+ 
+Design decisions:
+
+1. Options or parameters
+I initially thought to implement these features using the Filter options. However after clarifications of a few confusions, it seems that the filter parameter option suits this use case better for the following reasons
+	a) It allows users to specific the log directories. With options, since no arguments can be passes, it was not possible to do so and the logs would either be logged to the same location as qla session logs or to a default and unchangeable location.
+	b) Options parameters are used to specify flags for regex comparisons. Using parameters is more consistent with the current implementation.
+2. Per Session or Per Filter Instance: 
+	Logging for databases is done independent of the sessions. Thus the logs of two users querying same file will be logged in the same database log file.  
+3. Scope of variables: 
+	Parameters that are common for all sessions are stored in the QLA_INSTANCE. Since multiple sessions use same parameters for file path etc, no write operations are performed.
+4. Thread safe file I/O:
+	Since multiple sessions could write to the same file (even though each has its own descriptor for writing), thread safety was required. Though fwrite() is considered to be thread safe, it is not atomic and concurrent writes can create problem
+5. dblog design and issues:
+	This was a little challenging since I could not find proper reference to figure out in how many different ways a database can be changed/selected. Though most online material points to a single SQL statement, USE, I believe there might be other ways of querying across multiple databases even if a database is not selected. A better design in this scenario would perhaps be use of regular expressions. However since I couldn't gather or confirm the SQL statements for selecting/using databases, I decided to listen for USE keyword and capture the database name from the query. The same name is then used to create the corresponding log file.
+6. File I/O:
+	Tried to keep fileOpen etc to minimum to avoid costly operations during routing process
+
+NOTE: If you have selected database A and perform a query over another database B (while the database A is still selected), this query will be logged to the A.log.
+
+
+Tested:
+
+Tested with different scenarios
+1. None, one and all logging options enabled for qlafilter
+2. Multiple simultaneous clients

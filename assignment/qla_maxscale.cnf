@@ -1,0 +1,54 @@
+[maxscale]
+threads=1
+maxlog=1
+log_info=1
+
+[server1]
+type=server
+address=127.0.0.1
+port=3306
+protocol=MySQLBackend
+
+[MyLogFilter]
+type=filter
+module=qlafilter
+filebase=/var/log/qla/qla.log
+combinedlog=/var/log/qla/combined.log
+dblog=/var/log/qla/
+
+[MySQL Monitor]
+type=monitor
+module=mysqlmon
+servers=server1
+# See https://github.com/mariadb-corporation/MaxScale/blob/2.0/Documentation/Getting-Started/Configuration-Guide.md#user
+user=maxmon
+passwd=maxmonpassword
+monitor_interval=10000
+
+[Read Connection Router]
+type=service
+router=readconnroute
+servers=server1
+user=maxscale
+passwd=maxscalepassword
+router_options=running
+filters=MyLogFilter
+
+[Read Connection Listener]
+type=listener
+service=Read Connection Router
+protocol=MySQLClient
+address=127.0.0.1
+port=4008
+# Adjust this according to your installation.
+socket=/var/lib/maxscale/readconn.sock
+
+[MaxAdmin Service]
+type=service
+router=cli
+
+[MaxAdmin Unix Listener]
+type=listener
+service=MaxAdmin Service
+protocol=maxscaled
+socket=default

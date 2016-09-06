@@ -205,6 +205,9 @@ createInstance(char **options, FILTER_PARAMETER **params)
         my_instance->filebase = NULL;
         my_instance->combinedlog_path = NULL;
         my_instance->dblog_path = NULL;
+
+        my_instance->dblog_active = false;
+        my_instance->combinedlog_active = false;
         bool error = false;
 
         if (params)
@@ -285,12 +288,10 @@ createInstance(char **options, FILTER_PARAMETER **params)
         if(my_instance->combinedlog_path != NULL) 
         {
             MXS_INFO("qlafilter: 'combinedlog' parameter defined");
-            my_instance->combinedlog_active = true;
         }
         if(my_instance->dblog_path != NULL) 
         {
             MXS_INFO("qlafilter: 'dblog' parameter defined");
-             my_instance->dblog_active = true;
         }
         
         my_instance->sessions = 0;
@@ -332,6 +333,8 @@ createInstance(char **options, FILTER_PARAMETER **params)
             free(my_instance->dblog_path);
             free(my_instance->source);
             free(my_instance->userName);
+            free(my_instance->combinedlog_path);
+            free(my_instance->dblog_path);
             free(my_instance);
             my_instance = NULL;
         }
@@ -469,26 +472,34 @@ newSession(FILTER *instance, SESSION *session)
             }
             
             // Open combinedlog for append
-            my_instance->combinedlog_active = false;
-            if(my_instance->combinedlog_path != NULL) 
+            if(my_instance->combinedlog_path == NULL) 
             {
-                if((my_session->combinedlog_fp = openLog(my_instance->combinedlog_path, APPEND)) != NULL) 
-                {
-                        my_instance->combinedlog_active = true;
-                }                        
-
+                my_instance->combinedlog_active = false;
             }
-            //Check if dblog_path is not null and set dblog_active. Files are created later 
-            //for each database during routeQuery
-            if(my_instance->dblog_path != NULL)
+            if((my_session->combinedlog_fp = openLog(my_instance->combinedlog_path, APPEND)) == NULL) 
             {
-                {
-                    my_instance->dblog_active = true;
-                }
+                my_instance->combinedlog_active = false;
+            }                        
+            my_instance->combinedlog_active = true;
+           
+            
+            /* Todo: Create a temp file to verify read/writte permission
+             * and location validity. Set dblog to false if failure
+             */
+ 
+            if(my_instance->dblog_path == NULL) 
+            {
+                my_instance->dblog_active = false;
             }
+            else
+            {
+                my_instance->dblog_active = true;
+            }
+ 
         }
     }
-    return my_session;
+        // Set the state for dblog only. 
+         return my_session;
 }
 
 /**
@@ -574,6 +585,7 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
         {
             queue = gwbuf_make_contiguous(queue);
         }
+        
         if ((ptr = modutil_get_SQL(queue)) != NULL)
         {
             if ((my_instance->match == NULL ||
@@ -589,18 +601,17 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 writeLog(my_session->fp, buffer);
             }
                               
-                
-            /* Check if dblog is active (path specified) */  
-            if ((my_instance->dblog_active))
-            {
-               
+            
             /* Two queries are routed for a single USE "databaseName" statement
-            The first query has SELECT DATABASE() as the statement statement
+            The first query has SELECT DATABASE() as SQL query
             The second query has the name of the databsae used with the USE keyword
             First we look for the SELECT DATABASE statement and if found, set the flag
             If the flag is set, the contents of the (next) statement are copied
                to the dbName* pointer  */
-                        
+
+            /* Check if dblog is active (path specified) */  
+            if ((my_instance->dblog_active))
+            {
                 if(my_session->select_flag) 
                 {
                     sprintf(buffer, "%s%s.log",my_instance->dblog_path, ptr);                     
@@ -628,15 +639,14 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 }
             }
               
-                /* write the buffer contents to the log file */
-                /*Now check if the combinedlog is active */
+            /* if combinedlog is active, write to combinedlog file */
                 
             if ((my_instance->combinedlog_active) && (my_session->combinedlog_fp != NULL))
             {   
                 char session_string [QLA_STRING_BUFFER_SMALL];
                 sprintf(session_string, "Session Number:%d", my_session->session_id);                   
                 sprintf(buffer, "%s,%s@%s,%s %s\n", time_buffer, my_session->user,
-                        my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
+                my_session->remote, trim(squeeze_whitespace(ptr)),session_string);
                 writeLog(my_session->combinedlog_fp, buffer);
             } 
         }
