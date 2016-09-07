@@ -371,7 +371,7 @@ openLog(char *filename, char *fp_parameters)
     else
     {    
         char errbuf[STRERROR_BUFLEN];
-        MXS_ERROR("Opening combinedlog output file %s for qla "
+        MXS_ERROR("qlafilter: Opening log file %s for qla "
             "fileter failed due to %d, %s",
              filename,
              errno,
@@ -519,6 +519,8 @@ closeSession(FILTER *instance, void *session)
     if (my_session->active && my_session->fp)
     {
         fclose(my_session->fp);
+        fclose(my_session->combinedlog_fp);
+        fclose(my_session->dblog_fp);
     }
 }
 
@@ -603,18 +605,22 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                               
             
             /* Two queries are routed for a single USE "databaseName" statement
-            The first query has SELECT DATABASE() as SQL query
-            The second query has the name of the databsae used with the USE keyword
-            First we look for the SELECT DATABASE statement and if found, set the flag
+            The first query has SELECT DATABASE() as the query and the second 
+            query has the databsae name.
+             
+            First we look for the SELECT DATABASE statement and if found, set the select_flag
             If the flag is set, the contents of the (next) statement are copied
                to the dbName* pointer  */
 
-            /* Check if dblog is active (path specified) */  
+            /* Check if dblog is active */  
             if ((my_instance->dblog_active))
             {
                 if(my_session->select_flag) 
                 {
-                    sprintf(buffer, "%s%s.log",my_instance->dblog_path, ptr);                     
+                    /* create the complete path of the database file from 
+                     * combining dblog_path & ptr content(name of db if flag set) */
+
+                     sprintf(buffer, "%s%s.log",my_instance->dblog_path, ptr);                     
                     if((my_session->dblog_fp = openLog(buffer, APPEND)) != NULL) 
                     {
                         MXS_INFO("qlafilter: database changed to => %s for session %d", ptr, my_session->session_id);
