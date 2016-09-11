@@ -472,16 +472,14 @@ newSession(FILTER *instance, SESSION *session)
             }
             
             // Open combinedlog for append
-            if(my_instance->combinedlog_path == NULL) 
-            {
-                my_instance->combinedlog_active = false;
-            }
             if((my_session->combinedlog_fp = openLog(my_instance->combinedlog_path, APPEND)) == NULL) 
             {
                 my_instance->combinedlog_active = false;
-            }                        
-            my_instance->combinedlog_active = true;
-           
+            } 
+	    else
+	    {                       
+                my_instance->combinedlog_active = true;
+            }
             
             /* Todo: Create a temp file to verify read/writte permission
              * and location validity. Set dblog to false if failure
@@ -620,8 +618,8 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                     /* create the complete path of the database file from 
                      * combining dblog_path & ptr content(name of db if flag set) */
 
-                     sprintf(buffer, "%s%s.log",my_instance->dblog_path, ptr);                     
-                    if((my_session->dblog_fp = openLog(buffer, APPEND)) != NULL) 
+                     sprintf(dbFilename, "%s%s.log",my_instance->dblog_path, ptr);                     
+                    if((my_session->dblog_fp = openLog(dbFilename, APPEND)) != NULL) 
                     {
                         MXS_INFO("qlafilter: database changed to => %s for session %d", ptr, my_session->session_id);
                     }
